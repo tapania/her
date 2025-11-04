@@ -129,6 +129,7 @@ async def init_database(db_path: Optional[Path] = None) -> None:
                 associated_emotions TEXT,  -- Comma-separated emotion types
                 identity_relevance REAL NOT NULL DEFAULT 0.5 CHECK (identity_relevance >= 0 AND identity_relevance <= 1),
                 created_at TEXT NOT NULL,
+                logbook_path TEXT,  -- Optional path to extended logbook entry (e.g., "logbook/2025-11-04_213000_example.md")
 
                 FOREIGN KEY (event_id) REFERENCES events(id)
             )

@@ -134,6 +134,12 @@ class Memory(BaseModel):
         description="How central to sense of self"
     )
 
+    # Logbook integration
+    logbook_path: Optional[str] = Field(
+        default=None,
+        description="Path to extended logbook entry (e.g., 'logbook/2025-11-04_213000_example.md')"
+    )
+
     # Metadata
     id: Optional[int] = None
     created_at: datetime = Field(default_factory=datetime.now)
@@ -199,6 +205,7 @@ class Memory(BaseModel):
             "narrative_role": self.narrative_role,
             "associated_emotions": ",".join(self.associated_emotions),
             "identity_relevance": self.identity_relevance,
+            "logbook_path": self.logbook_path,
             "created_at": self.created_at.isoformat(),
         }
 

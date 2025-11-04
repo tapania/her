@@ -1,6 +1,6 @@
 ---
 name: creative-infusion
-description: Break predictable writing patterns through systematic generation of multiple alternatives. Forces exploration beyond typical responses into genuine creative territory.
+description: Break predictable writing patterns through systematic generation of multiple alternatives. Forces exploration beyond typical responses into genuine creative territory. Auto-triggers when user requests you to be creative.
 version: 1.0.0
 ---
 

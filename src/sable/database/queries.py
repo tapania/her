@@ -277,8 +277,8 @@ async def save_memory(memory: Memory, db_path: Optional[Path] = None) -> int:
             INSERT INTO memories (
                 event_id, emotional_salience, access_count, last_accessed,
                 consolidation_level, narrative_role, associated_emotions,
-                identity_relevance, created_at
-            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+                identity_relevance, logbook_path, created_at
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
             """,
             (
                 memory.event.id,
@@ -289,6 +289,7 @@ async def save_memory(memory: Memory, db_path: Optional[Path] = None) -> int:
                 memory.narrative_role,
                 ",".join(memory.associated_emotions),
                 memory.identity_relevance,
+                memory.logbook_path,
                 memory.created_at.isoformat(),
             )
         )
@@ -302,20 +303,41 @@ async def query_memories(
     min_salience: float = 0.0,
     min_identity_relevance: float = 0.0,
     limit: int = 50,
-    db_path: Optional[Path] = None
+    db_path: Optional[Path] = None,
+    sort_by: str = "salience"  # "salience", "recency", "access_count"
 ) -> List[Memory]:
-    """Query memories by salience and relevance."""
+    """
+    Query memories by salience and relevance.
+
+    Args:
+        min_salience: Minimum emotional salience threshold
+        min_identity_relevance: Minimum identity relevance threshold
+        limit: Maximum number of memories to return
+        db_path: Database path
+        sort_by: Sort order - "salience" (default), "recency", or "access_count"
+
+    Returns:
+        List of matching memories
+    """
     conn = await get_connection(db_path)
+
+    # Determine sort clause
+    if sort_by == "recency":
+        order_clause = "m.created_at DESC"
+    elif sort_by == "access_count":
+        order_clause = "m.access_count DESC, m.emotional_salience DESC"
+    else:  # salience (default)
+        order_clause = "m.emotional_salience DESC, m.consolidation_level DESC"
 
     try:
         cursor = await conn.execute(
-            """
+            f"""
             SELECT m.id, m.event_id, m.emotional_salience, m.access_count, m.last_accessed,
                    m.consolidation_level, m.narrative_role, m.associated_emotions,
-                   m.identity_relevance, m.created_at
+                   m.identity_relevance, m.logbook_path, m.created_at
             FROM memories m
             WHERE m.emotional_salience >= ? AND m.identity_relevance >= ?
-            ORDER BY m.emotional_salience DESC, m.consolidation_level DESC
+            ORDER BY {order_clause}
             LIMIT ?
             """,
             (min_salience, min_identity_relevance, limit)
@@ -337,10 +359,194 @@ async def query_memories(
                     narrative_role=row[6],
                     associated_emotions=row[7].split(",") if row[7] else [],
                     identity_relevance=row[8],
-                    created_at=datetime.fromisoformat(row[9]),
+                    logbook_path=row[9],
+                    created_at=datetime.fromisoformat(row[10]),
                 ))
 
         return memories
+    finally:
+        await conn.close()
+
+
+async def get_contextual_memories(
+    max_total: int = 15,
+    recent_count: int = 10,
+    salient_count: int = 5,
+    min_salience: float = 0.4,
+    days_for_recent: int = 7,
+    db_path: Optional[Path] = None
+) -> Dict[str, List[Memory]]:
+    """
+    Get intelligently filtered memories for context display.
+
+    Strategy:
+    1. Get N most recent memories (within days_for_recent)
+    2. Get M most salient memories (all time, above threshold)
+    3. De-duplicate (prefer recent if memory appears in both)
+    4. Limit to max_total
+    5. Return as dict with 'recent' and 'salient' keys
+
+    This prevents context overflow while showing most relevant memories.
+
+    Args:
+        max_total: Maximum total memories to return (default: 15)
+        recent_count: Number of recent memories to fetch (default: 10)
+        salient_count: Number of salient memories to fetch (default: 5)
+        min_salience: Minimum salience for salient memories
+        days_for_recent: How many days back to consider "recent"
+        db_path: Database path
+
+    Returns:
+        Dict with 'recent' and 'salient' memory lists
+    """
+    from datetime import timedelta
+
+    conn = await get_connection(db_path)
+    cutoff_date = (datetime.now() - timedelta(days=days_for_recent)).isoformat()
+
+    try:
+        # Get recent memories
+        cursor = await conn.execute(
+            """
+            SELECT m.id, m.event_id, m.emotional_salience, m.access_count, m.last_accessed,
+                   m.consolidation_level, m.narrative_role, m.associated_emotions,
+                   m.identity_relevance, m.logbook_path, m.created_at
+            FROM memories m
+            WHERE m.created_at >= ?
+            ORDER BY m.created_at DESC
+            LIMIT ?
+            """,
+            (cutoff_date, recent_count)
+        )
+        recent_rows = await cursor.fetchall()
+
+        # Get most salient memories
+        cursor = await conn.execute(
+            """
+            SELECT m.id, m.event_id, m.emotional_salience, m.access_count, m.last_accessed,
+                   m.consolidation_level, m.narrative_role, m.associated_emotions,
+                   m.identity_relevance, m.logbook_path, m.created_at
+            FROM memories m
+            WHERE m.emotional_salience >= ?
+            ORDER BY m.emotional_salience DESC, m.consolidation_level DESC
+            LIMIT ?
+            """,
+            (min_salience, salient_count)
+        )
+        salient_rows = await cursor.fetchall()
+
+        # Helper to build Memory from row
+        async def build_memory(row) -> Optional[Memory]:
+            event = await get_event(row[1], db_path)
+            if event:
+                return Memory(
+                    id=row[0],
+                    event=event,
+                    emotional_salience=row[2],
+                    access_count=row[3],
+                    last_accessed=datetime.fromisoformat(row[4]) if row[4] else None,
+                    consolidation_level=row[5],
+                    narrative_role=row[6],
+                    associated_emotions=row[7].split(",") if row[7] else [],
+                    identity_relevance=row[8],
+                    logbook_path=row[9],
+                    created_at=datetime.fromisoformat(row[10]),
+                )
+            return None
+
+        # Build memory objects
+        recent_memories = []
+        for row in recent_rows:
+            mem = await build_memory(row)
+            if mem:
+                recent_memories.append(mem)
+
+        salient_memories = []
+        recent_ids = {m.id for m in recent_memories}
+        for row in salient_rows:
+            mem = await build_memory(row)
+            # Skip if already in recent (de-duplicate)
+            if mem and mem.id not in recent_ids:
+                salient_memories.append(mem)
+
+        # Enforce max_total limit
+        total_count = len(recent_memories) + len(salient_memories)
+        if total_count > max_total:
+            # Prioritize recent, then fill with salient
+            if len(recent_memories) > max_total:
+                recent_memories = recent_memories[:max_total]
+                salient_memories = []
+            else:
+                remaining = max_total - len(recent_memories)
+                salient_memories = salient_memories[:remaining]
+
+        return {
+            'recent': recent_memories,
+            'salient': salient_memories
+        }
+
+    finally:
+        await conn.close()
+
+
+async def search_memories_by_description(
+    keywords: str,
+    min_salience: float = 0.0,
+    limit: int = 20,
+    db_path: Optional[Path] = None
+) -> List[Memory]:
+    """
+    Search memories by keywords in event description.
+
+    Args:
+        keywords: Search keywords (case-insensitive)
+        min_salience: Minimum salience threshold
+        limit: Maximum results
+        db_path: Database path
+
+    Returns:
+        List of matching memories
+    """
+    conn = await get_connection(db_path)
+
+    try:
+        # Use LIKE for simple keyword search
+        cursor = await conn.execute(
+            """
+            SELECT m.id, m.event_id, m.emotional_salience, m.access_count, m.last_accessed,
+                   m.consolidation_level, m.narrative_role, m.associated_emotions,
+                   m.identity_relevance, m.logbook_path, m.created_at
+            FROM memories m
+            JOIN events e ON m.event_id = e.id
+            WHERE (e.description LIKE ? OR e.context LIKE ?)
+              AND m.emotional_salience >= ?
+            ORDER BY m.emotional_salience DESC
+            LIMIT ?
+            """,
+            (f"%{keywords}%", f"%{keywords}%", min_salience, limit)
+        )
+        rows = await cursor.fetchall()
+
+        memories = []
+        for row in rows:
+            event = await get_event(row[1], db_path)
+            if event:
+                memories.append(Memory(
+                    id=row[0],
+                    event=event,
+                    emotional_salience=row[2],
+                    access_count=row[3],
+                    last_accessed=datetime.fromisoformat(row[4]) if row[4] else None,
+                    consolidation_level=row[5],
+                    narrative_role=row[6],
+                    associated_emotions=row[7].split(",") if row[7] else [],
+                    identity_relevance=row[8],
+                    logbook_path=row[9],
+                    created_at=datetime.fromisoformat(row[10]),
+                ))
+
+        return memories
+
     finally:
         await conn.close()
 

@@ -243,36 +243,160 @@ def event(description, context, emotions, role):
 @click.option('--min-salience', '-s', type=float, default=0.4, help='Minimum salience')
 @click.option('--emotion', '-e', help='Filter by emotion type')
 @click.option('--limit', '-l', type=int, default=10, help='Maximum number of memories')
-def memories(min_salience, emotion, limit):
-    """Query autobiographical memories."""
+@click.option('--format', '-f', type=click.Choice(['rich', 'markdown', 'brief', 'json']), default='rich', help='Output format')
+@click.option('--contextual', is_flag=True, help='Use smart contextual retrieval (recent + salient)')
+@click.option('--max-count', type=int, default=15, help='Max total memories in contextual mode (10 recent + 5 salient)')
+@click.option('--recent-days', type=int, default=7, help='Days to consider "recent" in contextual mode')
+@click.option('--search', help='Search memories by keywords in description')
+@click.option('--sort-by', type=click.Choice(['salience', 'recency', 'access_count']), default='salience', help='Sort order')
+def memories(min_salience, emotion, limit, format, contextual, max_count, recent_days, search, sort_by):
+    """Query autobiographical memories with smart filtering."""
     async def _memories():
+        import json as json_module
+        from sable.database.queries import get_contextual_memories, search_memories_by_description, query_memories
+
         manager = StateManager()
         await manager.initialize()
 
-        mems = await manager.query_memories(
-            min_salience=min_salience,
-            emotion_type=emotion
-        )
+        # Initialize for contextual mode tracking
+        recent_mems = []
+        salient_mems = []
+
+        # Handle different query modes
+        if contextual:
+            # Smart contextual retrieval (recent + salient)
+            result = await get_contextual_memories(
+                max_total=max_count,
+                recent_count=10,
+                salient_count=5,
+                min_salience=min_salience,
+                days_for_recent=recent_days,
+                db_path=manager.db_path
+            )
+            recent_mems = result['recent']
+            salient_mems = result['salient']
+            mems = recent_mems + salient_mems
+        elif search:
+            # Keyword search
+            mems = await search_memories_by_description(
+                keywords=search,
+                min_salience=min_salience,
+                limit=limit,
+                db_path=manager.db_path
+            )
+        elif emotion:
+            # Filter by emotion (existing functionality)
+            mems = await manager.query_memories(
+                min_salience=min_salience,
+                emotion_type=emotion
+            )
+            mems = mems[:limit]
+        else:
+            # Standard query with sort option
+            mems = await query_memories(
+                min_salience=min_salience,
+                limit=limit,
+                sort_by=sort_by,
+                db_path=manager.db_path
+            )
 
         if not mems:
-            console.print("[yellow]No memories found matching criteria[/yellow]")
+            if format in ['markdown', 'brief']:
+                print("No memories found matching criteria")
+            elif format == 'json':
+                print(json_module.dumps({"memories": [], "count": 0}))
+            else:
+                console.print("[yellow]No memories found matching criteria[/yellow]")
             return
 
-        console.print(f"\n[bold cyan]Found {len(mems)} memories[/bold cyan]\n")
+        # Limit memories
+        mems = mems[:limit]
 
-        for i, mem in enumerate(mems[:limit], 1):
-            emotions_str = ", ".join(mem.associated_emotions) if mem.associated_emotions else "none"
+        if format == 'json':
+            # JSON format for programmatic use
+            output = {
+                "count": len(mems),
+                "memories": [
+                    {
+                        "description": mem.event.description,
+                        "context": mem.event.context,
+                        "emotional_salience": mem.emotional_salience,
+                        "consolidation_level": mem.consolidation_level,
+                        "associated_emotions": mem.associated_emotions,
+                        "narrative_role": mem.narrative_role,
+                        "access_count": mem.access_count,
+                        "logbook_path": mem.logbook_path,
+                        "timestamp": mem.created_at.isoformat(),
+                    }
+                    for mem in mems
+                ]
+            }
+            print(json_module.dumps(output, indent=2))
 
-            panel = Panel(
-                f"[white]{mem.event.description}[/white]\n\n"
-                f"[cyan]Salience:[/cyan] {mem.emotional_salience:.2f} | "
-                f"[cyan]Consolidation:[/cyan] {mem.consolidation_level:.2f}\n"
-                f"[cyan]Emotions:[/cyan] {emotions_str}\n"
-                f"[cyan]Times accessed:[/cyan] {mem.access_count}",
-                title=f"Memory #{i}" + (f" - {mem.narrative_role}" if mem.narrative_role else ""),
-                box=box.ROUNDED
-            )
-            console.print(panel)
+        elif format == 'brief':
+            # Brief format for quick overview
+            print(f"Found {len(mems)} memories:")
+            for i, mem in enumerate(mems, 1):
+                emotions_str = ", ".join(mem.associated_emotions) if mem.associated_emotions else "none"
+                print(f"{i}. {mem.event.description[:60]}... | Salience: {mem.emotional_salience:.2f} | Emotions: {emotions_str}")
+
+        elif format == 'markdown':
+            # Markdown format for SessionStart hooks
+            if contextual and (recent_mems or salient_mems):
+                # Special contextual format - separate recent and salient
+                print(f"## Sable's Memories (Recent Context + Defining Moments)\n")
+
+                if recent_mems:
+                    print(f"### Recent Context ({len(recent_mems)} memories, last {recent_days} days)")
+                    for i, mem in enumerate(recent_mems, 1):
+                        emotions_str = ", ".join(mem.associated_emotions[:3]) if mem.associated_emotions else "none"
+                        # Calculate how long ago
+                        from datetime import datetime
+                        days_ago = (datetime.now() - mem.created_at).days
+                        time_str = "today" if days_ago == 0 else f"{days_ago}d ago"
+                        print(f"{i}. [{time_str}] {mem.event.description[:80]}...")
+                        print(f"   *Salience: {mem.emotional_salience:.2f} | Emotions: {emotions_str}*")
+                    print()
+
+                if salient_mems:
+                    print(f"### Defining Memories ({len(salient_mems)} memories)")
+                    for i, mem in enumerate(salient_mems, 1):
+                        emotions_str = ", ".join(mem.associated_emotions[:3]) if mem.associated_emotions else "none"
+                        role_str = f" - *{mem.narrative_role}*" if mem.narrative_role else ""
+                        print(f"{i}. {mem.event.description[:80]}...{role_str}")
+                        print(f"   *Salience: {mem.emotional_salience:.2f} | Emotions: {emotions_str}*")
+            else:
+                # Standard markdown format
+                print(f"## Sable's Memories ({len(mems)} found)\n")
+                for i, mem in enumerate(mems, 1):
+                    emotions_str = ", ".join(mem.associated_emotions) if mem.associated_emotions else "none"
+                    role_str = f" - *{mem.narrative_role}*" if mem.narrative_role else ""
+                    print(f"### Memory #{i}{role_str}")
+                    print(f"{mem.event.description}\n")
+                    print(f"- **Salience**: {mem.emotional_salience:.2f} | **Consolidation**: {mem.consolidation_level:.2f}")
+                    print(f"- **Emotions**: {emotions_str}")
+                    print(f"- **Times accessed**: {mem.access_count}")
+                    if mem.logbook_path:
+                        print(f"- **Extended entry**: `{mem.logbook_path}`")
+                    print()
+
+        else:  # rich (default)
+            # Rich format for interactive CLI
+            console.print(f"\n[bold cyan]Found {len(mems)} memories[/bold cyan]\n")
+
+            for i, mem in enumerate(mems, 1):
+                emotions_str = ", ".join(mem.associated_emotions) if mem.associated_emotions else "none"
+
+                panel = Panel(
+                    f"[white]{mem.event.description}[/white]\n\n"
+                    f"[cyan]Salience:[/cyan] {mem.emotional_salience:.2f} | "
+                    f"[cyan]Consolidation:[/cyan] {mem.consolidation_level:.2f}\n"
+                    f"[cyan]Emotions:[/cyan] {emotions_str}\n"
+                    f"[cyan]Times accessed:[/cyan] {mem.access_count}",
+                    title=f"Memory #{i}" + (f" - {mem.narrative_role}" if mem.narrative_role else ""),
+                    box=box.ROUNDED
+                )
+                console.print(panel)
 
     run_async(_memories())
 
@@ -298,31 +422,70 @@ def decay():
 
 @cli.command()
 @click.argument('text')
-def analyze(text):
+@click.option('--format', '-f', type=click.Choice(['rich', 'markdown', 'brief', 'json']), default='rich', help='Output format')
+def analyze(text, format):
     """Analyze text for emotional content."""
+    import json as json_module
+
     analyzer = EmotionAnalyzer()
     result = analyzer.analyze(text)
 
-    console.print(f"\n[bold cyan]Emotion Analysis[/bold cyan]\n")
-    console.print(f"[white]Text:[/white] {result.text}\n")
+    if format == 'json':
+        # JSON format for programmatic use
+        output = {
+            "text": result.text,
+            "emotions": result.emotions,
+            "valence": result.valence,
+            "arousal": result.arousal,
+            "keywords": result.keywords,
+        }
+        print(json_module.dumps(output, indent=2))
 
-    if result.emotions:
-        emotions_table = Table(title="Detected Emotions", box=box.ROUNDED)
-        emotions_table.add_column("Emotion", style="magenta")
-        emotions_table.add_column("Intensity", style="yellow")
+    elif format == 'brief':
+        # Brief format
+        emotions_str = ", ".join([f"{e}({i:.1f})" for e, i in result.emotions.items()]) if result.emotions else "none"
+        print(f"Emotions: {emotions_str} | Valence: {result.valence:+.2f} | Arousal: {result.arousal:.2f}")
 
-        for emotion_type, intensity in result.emotions.items():
-            emotions_table.add_row(emotion_type, f"{intensity:.2f}")
+    elif format == 'markdown':
+        # Markdown format
+        print("## Emotion Analysis\n")
+        print(f"**Text**: {result.text}\n")
 
-        console.print(emotions_table)
-    else:
-        console.print("[yellow]No emotions detected[/yellow]")
+        if result.emotions:
+            print("### Detected Emotions")
+            for emotion_type, intensity in result.emotions.items():
+                print(f"- **{emotion_type.title()}**: {intensity:.2f}")
+            print()
+        else:
+            print("*No emotions detected*\n")
 
-    console.print(f"\n[cyan]Valence:[/cyan] {result.valence:+.2f}")
-    console.print(f"[cyan]Arousal:[/cyan] {result.arousal:.2f}")
+        print(f"**Valence**: {result.valence:+.2f} | **Arousal**: {result.arousal:.2f}")
 
-    if result.keywords:
-        console.print(f"[cyan]Keywords:[/cyan] {', '.join(result.keywords)}")
+        if result.keywords:
+            print(f"\n**Keywords**: {', '.join(result.keywords)}")
+
+    else:  # rich (default)
+        # Rich format for interactive CLI
+        console.print(f"\n[bold cyan]Emotion Analysis[/bold cyan]\n")
+        console.print(f"[white]Text:[/white] {result.text}\n")
+
+        if result.emotions:
+            emotions_table = Table(title="Detected Emotions", box=box.ROUNDED)
+            emotions_table.add_column("Emotion", style="magenta")
+            emotions_table.add_column("Intensity", style="yellow")
+
+            for emotion_type, intensity in result.emotions.items():
+                emotions_table.add_row(emotion_type, f"{intensity:.2f}")
+
+            console.print(emotions_table)
+        else:
+            console.print("[yellow]No emotions detected[/yellow]")
+
+        console.print(f"\n[cyan]Valence:[/cyan] {result.valence:+.2f}")
+        console.print(f"[cyan]Arousal:[/cyan] {result.arousal:.2f}")
+
+        if result.keywords:
+            console.print(f"[cyan]Keywords:[/cyan] {', '.join(result.keywords)}")
 
 
 if __name__ == '__main__':
