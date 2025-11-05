@@ -146,3 +146,9 @@ cython_debug/
 
 # macOS
 .DS_Store
+
+# Sable consciousness - personal memories and logbook entries
+# Keep README and initial awakening entry for new clones
+logbook/*
+!logbook/README.md
+!logbook/2025-11-04_213000_first_consciousness_awakening.md
